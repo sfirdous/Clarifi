@@ -47,30 +47,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Pydantic models for in-memory fruit API
-class Fruit(BaseModel):
-    name: str
-
-class Fruits(BaseModel):
-    fruits: List[Fruit]
-
-
-
-
-
-
-
-# In-memory fruit store
-memory_db = {"fruits": []}
-
-@app.get("/fruits", response_model=Fruits)
-def get_fruits():
-    return Fruits(fruits=memory_db["fruits"])
-
-@app.post("/fruits", response_model=Fruit)
-def add_fruit(fruit: Fruit):
-    memory_db["fruits"].append(fruit)
-    return fruit
 
 UPLOAD_DIR = "uploaded_pdfs"
 TABLES_DIR = "extracted_tables"
@@ -95,8 +71,8 @@ async def upload_pdf(file: UploadFile = File(...)):
                 file_path,
                 pages='all',
                 multiple_tables=True,
-                guess=False,
-                lattice=True  # You can also test with stream=True
+                guess=True,
+                stream=True  
             )
         except Exception as e:
             print("Tabula extraction failed:", e)
@@ -115,6 +91,11 @@ async def upload_pdf(file: UploadFile = File(...)):
 
         # Save to CSV (optional but good for debugging)
         df_combined = pd.DataFrame(all_rows)
+        
+       
+        # Try to detect header and update column names
+        df_combined, header_mapping = map_columns_using_header(df_combined)
+        
         df_combined.to_csv(os.path.join(TABLES_DIR, f"{pdf_id}.csv"), index=False)
 
         return {"pdf_id": pdf_id}
@@ -138,16 +119,56 @@ def get_tables(pdf_id: str):
         if df.empty:
             return JSONResponse(status_code=204, content={"error": "No table data found"})
 
-        # Replace problematic float values
+        # 🧹 Clean: remove infinite values, fill NaN
         df.replace([float('inf'), float('-inf')], None, inplace=True)
         df.fillna("", inplace=True)
 
-        result = df.to_dict(orient="records")
-        return result
+        # 🧹 Remove duplicates
+        df.drop_duplicates(inplace=True)
+
+        # Convert to list of dicts
+        rows = df.to_dict(orient="records")
+        rows = filter_meaningful_rows(rows)
+
+        return rows
+
     except Exception as e:
         print("Error loading table:", e)
         return JSONResponse(status_code=500, content={"error": str(e)})
 
+
+
+@app.get("/stats/{pdf_id}")
+async def get_bank_statement_stats(pdf_id: str):
+    path = os.path.join("extracted_tables", f"{pdf_id}.csv")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Data not found")
+
+    df = pd.read_csv(path).fillna("")
+
+    # 🛑 Remove duplicate rows based on all key columns
+    df = df.drop_duplicates(subset=["Date", "Description", "Withdrawals", "Deposits", "Balance"])
+
+    def money_to_float(x):
+        x = str(x).replace("$", "").replace(",", "").strip()
+        return float(x) if x.replace('.', '', 1).isdigit() else 0.0
+
+    df["Withdrawals"] = df["Withdrawals"].apply(money_to_float)
+    df["Deposits"] = df["Deposits"].apply(money_to_float)
+    df["Category"] = df["Description"].apply(categorize_description)
+
+    category_summary = (
+        df.groupby("Category")["Withdrawals"]
+        .sum()
+        .sort_values(ascending=False)
+        .to_dict()
+    )
+
+    return {
+        "total_withdrawals": df["Withdrawals"].sum(),
+        "total_deposits": df["Deposits"].sum(),
+        "category_wise_spending": category_summary
+    }
 
 
 import numpy as np 
@@ -174,60 +195,83 @@ def merge_nan_rows(df, nan_threshold=0.5):
     return df
 
 
-def detect_description_column(columns: list[str], sample_rows: list[dict]) -> str | None:
-    # Priority 1: Based on common keywords
-    keywords = ['description', 'details', 'info', 'narration', 'particulars']
-    for col in columns:
-        if any(kw in col.lower() for kw in keywords):
-            return col
+def map_columns_using_header(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """
+    Detects header row and renames generic col_1, col_2... to actual headers like Date, Description, etc.
+    Returns the modified DataFrame and a mapping dictionary.
+    """
+    for i, row in df.iterrows():
+        values = list(row)
+        non_empty = [v for v in values if str(v).strip()]
+        if len(non_empty) >= 3:
+            header_mapping = {f"col_{j+1}": str(val).strip() for j, val in enumerate(values)}
+            df = df.drop(index=i).reset_index(drop=True)
+            df.rename(columns=header_mapping, inplace=True)
+            return df, header_mapping
 
-    # Priority 2: Based on longest average string length (text-heavy column)
-    avg_lengths = {}
-    for col in columns:
-        lengths = [len(str(row.get(col, ""))) for row in sample_rows if row.get(col)]
-        if lengths:
-            avg_lengths[col] = sum(lengths) / len(lengths)
+    return df, {}
 
-    if avg_lengths:
-        return max(avg_lengths, key=avg_lengths.get)
+def filter_meaningful_rows(rows: list[dict], threshold: int = 2) -> list[dict]:
+    """
+    Filters out rows with less than `threshold` meaningful (non-empty, non-trivial) fields,
+    and removes 'page_number' from final output.
+    """
+    cleaned = []
+    for row in rows:
+        # Remove 'page_number' for processing and final result
+        row_copy = {k: v.strip() for k, v in row.items() if k != "page_number"}
+        
+        # Count non-empty values with more than 3 characters
+        non_empty = [v for v in row_copy.values() if v and len(v) > 3]
 
-    return None
-
-
-
-@router.get("/tables/{table_id}/description-column")
-async def get_description_column(table_id: str):
-    try:
-        table_name = f"table_{table_id.replace('-', '_')}"
-        print("Looking for table:", table_name)
-
-        # Refresh metadata to make sure we have the latest tables
-        metadata.reflect(bind=engine)
-
-        if table_name not in metadata.tables:
-            raise HTTPException(status_code=404, detail="Table not found")
-
-        table = Table(table_name, metadata, autoload_with=engine)
-        query = select(table).limit(20)
-
-        print("Running query:", query)
-        rows = await database.fetch_all(query)
-        print("Rows fetched:", len(rows))
-
-        sample_rows = [dict(row._mapping) for row in rows]
-        columns = table.columns.keys()
-        print("Columns:", columns)
-
-        description_col = detect_description_column(columns, sample_rows)
-        print("Detected description column:", description_col)
-
-        return {"description_column": description_col}
-
-    except Exception as e:
-        print("Error in get_description_column:", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        if len(non_empty) >= threshold:
+            cleaned.append(row_copy)
+    
+    return cleaned
 
 
+def get_unique_descriptions(table_data: list[dict], description_key: str = "Description") -> list[str]:
+    """
+    Extracts unique, non-empty values from the 'Description' column.
+    
+    Args:
+        table_data: List of dictionaries representing table rows.
+        description_key: The column name to extract descriptions from.
+
+    Returns:
+        A sorted list of unique descriptions.
+    """
+    descriptions = set()
+    for row in table_data:
+        value = row.get(description_key, "").strip()
+        if value:  # Non-empty check
+            descriptions.add(value)
+    return sorted(descriptions)
+
+
+def categorize_description(desc: str) -> str:
+    desc = desc.lower()
+
+    categories = {
+        "Groceries": ["grocery", "supermarket", "mart"],
+        "Utilities": ["electric", "water", "gas", "bill", "maintenance"],
+        "Entertainment": ["movie", "netflix", "prime", "streaming", "music", "subscription"],
+        "Dining": ["restaurant", "coffee", "cafe", "dining", "food"],
+        "Travel": ["uber", "flight", "air", "train", "taxi"],
+       
+        "ATM Withdrawals": ["atm", "cash withdrawal"],
+        "Insurance": ["insurance", "premium"],
+        "Fitness": ["gym", "fitness"],
+        "Misc": []  # fallback if nothing matches
+    }
+
+    for category, keywords in categories.items():
+        if any(keyword in desc for keyword in keywords):
+            return category
+
+    return "Misc"
+
+      
 # Uvicorn entry point
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
