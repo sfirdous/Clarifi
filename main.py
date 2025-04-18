@@ -17,6 +17,8 @@ import os
 import uuid
 import json
 import pandas as pd
+from datetime import datetime
+
 
 
 # Lifespan function handles startup and shutdown events
@@ -72,7 +74,7 @@ async def upload_pdf(file: UploadFile = File(...)):
                 pages='all',
                 multiple_tables=True,
                 guess=True,
-                stream=True  
+                lattice=True  
             )
         except Exception as e:
             print("Tabula extraction failed:", e)
@@ -163,15 +165,83 @@ async def get_bank_statement_stats(pdf_id: str):
         .sort_values(ascending=False)
         .to_dict()
     )
+    
+    essential_categories = ["Groceries", "Utilities", "Insurance"]
+    df["SpendingType"] = df["Category"].apply(lambda cat: "Essential" if cat in essential_categories else "Non-Essential")
 
+    essential_summary = (
+      df.groupby("SpendingType")["Withdrawals"]
+      .sum()
+      .to_dict()
+    )
+
+    total_withdrawals = df["Withdrawals"].sum()
+    total_deposits = df["Deposits"].sum()
+    
+    
+    # Prevent division by zero
+    if total_withdrawals == 0:
+       income_vs_expense_ratio = None
+    else:
+       income_vs_expense_ratio = round(total_deposits / total_withdrawals, 2)
+       
+       
     return {
         "total_withdrawals": df["Withdrawals"].sum(),
         "total_deposits": df["Deposits"].sum(),
-        "category_wise_spending": category_summary
+        "category_wise_spending": category_summary,
+        "essential_vs_nonessential": essential_summary,
+        "income_vs_expense_ratio": income_vs_expense_ratio
     }
 
 
+@app.get("/weekly-trends/{pdf_id}")
+async def get_weekly_trends(pdf_id: str):
+    path = os.path.join("extracted_tables", f"{pdf_id}.csv")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Data not found")
+
+    df = pd.read_csv(path).fillna("")
+    df = df.drop_duplicates(subset=["Date", "Description", "Withdrawals", "Deposits", "Balance"])
+
+    # Clean up and standardize money
+    def money_to_float(x):
+        x = str(x).replace("$", "").replace(",", "").strip()
+        return float(x) if x.replace('.', '', 1).isdigit() else 0.0
+
+    df["Withdrawals"] = df["Withdrawals"].apply(money_to_float)
+    df["Deposits"] = df["Deposits"].apply(money_to_float)
+
+    # Convert Date to datetime object
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = df.dropna(subset=["Date"])
+
+    # Calculate week of month and month label
+    df["WeekOfMonth"] = df["Date"].apply(get_week_of_month)
+    df["Month"] = df["Date"].dt.strftime("%Y-%m")
+
+    # Group by month and week of month
+    weekly = df.groupby(["Month", "WeekOfMonth"]).agg({
+        "Withdrawals": "sum",
+        "Deposits": "sum"
+    }).reset_index()
+
+    # Combine into readable label
+    weekly["WeekLabel"] = weekly["Month"] + " - Week " + weekly["WeekOfMonth"].astype(str)
+
+    # Optional: reorder columns
+    weekly = weekly[["WeekLabel", "Withdrawals", "Deposits"]]
+
+    return weekly.to_dict(orient="records")
+
 import numpy as np 
+import math
+
+def get_week_of_month(date: pd.Timestamp) -> int:
+    first_day = date.replace(day=1)
+    dom = date.day
+    adjusted_dom = dom + first_day.weekday()  # Adjust based on start weekday
+    return math.ceil(adjusted_dom / 7.0)
 
 def merge_nan_rows(df, nan_threshold=0.5):
     """
@@ -213,7 +283,7 @@ def map_columns_using_header(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
 
 def filter_meaningful_rows(rows: list[dict], threshold: int = 2) -> list[dict]:
     """
-    Filters out rows with less than `threshold` meaningful (non-empty, non-trivial) fields,
+    Filters out rows with less than threshold meaningful (non-empty, non-trivial) fields,
     and removes 'page_number' from final output.
     """
     cleaned = []
@@ -274,4 +344,4 @@ def categorize_description(desc: str) -> str:
       
 # Uvicorn entry point
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000) 
