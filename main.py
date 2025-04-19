@@ -7,7 +7,7 @@ from typing import List
 from contextlib import asynccontextmanager
 
 from backend.database import database, metadata, engine
-from backend.models import pdfs, tables  # SQLAlchemy table definitions
+from backend.models import pdfs, tables,budgets  # SQLAlchemy table definitions
 
 from sqlalchemy import Table, MetaData, select
 
