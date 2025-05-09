@@ -4,8 +4,9 @@ from backend.utils.categorizer import get_week_of_month
 
 def process(file_path: str) -> pd.DataFrame:
     try:
+        
         print("[HDFC Parser] Extracting tables using Tabula...")
-
+        # Read tables from the PDF file using Tabula
         tables = tabula.read_pdf(
             file_path,
             pages='all',
@@ -14,14 +15,19 @@ def process(file_path: str) -> pd.DataFrame:
             stream=True
         )
 
+        # Check if any tables were extracted
         if not tables:
             raise ValueError("No tables extracted from the PDF.")
 
+        # Print the number of tables found
         print(f"[HDFC Parser] Total tables found: {len(tables)}")
 
+        # Clean and process each table
         cleaned_tables = []
 
+        # Iterate through each DataFrame
         for df in tables:
+        
             df = df.copy()
 
             # Drop empty rows
